@@ -42,7 +42,7 @@ func (r *ConfigRouter) Config(app *fiber.App) *fiber.App {
 	}))
 
 	app.Use(limiter.New(limiter.Config{
-		Max:               20, // TODO: adjust
+		Max:               200000, // TODO: adjust
 		Expiration:        60 * time.Second,
 		LimiterMiddleware: limiter.SlidingWindow{},
 	}))
