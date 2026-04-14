@@ -11,9 +11,9 @@ import (
 	"log"
 	"math/rand"
 	"sort"
+	"sync"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/caarlos0/env/v11"
 	"github.com/fatih/color"
 	"github.com/redis/go-redis/v9"
@@ -21,14 +21,18 @@ import (
 )
 
 type redisConfig struct {
-	RedisTTL time.Duration `env:"REDIS_TTL" envDefault:"10"` // min
+	RedisTTL int `env:"REDIS_TTL"` // min
 }
 
 type resourceLog struct {
-	db       *gorm.DB
-	redis    *redis.Client
-	redisCof *redisConfig
+	db        *gorm.DB
+	redis     *redis.Client
+	redisConf *redisConfig
 }
+
+var (
+	ErrModelUnavailable = errors.New("Recommendation model is temporarily unavailable")
+)
 
 func NewUserService(db *gorm.DB, redisClient *redis.Client) *resourceLog {
 	redisConf := redisConfig{}
@@ -37,39 +41,125 @@ func NewUserService(db *gorm.DB, redisClient *redis.Client) *resourceLog {
 	}
 
 	return &resourceLog{
-		db:       db,
-		redis:    redisClient,
-		redisCof: &redisConf,
+		db:        db,
+		redis:     redisClient,
+		redisConf: &redisConf,
 	}
 }
 
-var ErrModelUnavailable = errors.New("Recommendation model is temporarily unavailable")
+func (r *resourceLog) GetUsersRecommendations(req request.GetUsersRecommendations) (res response.GetUsersRecommendations, err error) {
+	startedAt := time.Now().UTC()
 
-func (r *resourceLog) GetUsers(req request.GetUsers) (res []response.GetUsers, err error) {
-	var users []orm.Users
-
-	db := r.db.Model(&orm.Users{}).Find(&users)
-	err = db.Error
-	if err != nil {
+	var totalUsers int64
+	if err = r.db.Model(&orm.Users{}).Count(&totalUsers).Error; err != nil {
 		return
 	}
 
-	res = make([]response.GetUsers, 0, len(users))
-	for _, user := range users {
-		res = append(res, mapUserToResponse(user))
+	offset := (req.Page - 1) * req.Limit
+	var users []orm.Users
+	if err = r.db.Model(&orm.Users{}).
+		Order("id ASC").
+		Offset(offset).
+		Limit(req.Limit).
+		Find(&users).Error; err != nil {
+		return
+	}
+
+	results := make([]response.UserRecommendations, len(users))
+	if len(users) > 0 {
+		workerCount := req.Limit
+		if workerCount > 8 {
+			workerCount = 8
+		}
+
+		if workerCount > len(users) {
+			workerCount = len(users)
+		}
+
+		jobs := make(chan int)
+		var wg sync.WaitGroup
+
+		for i := 0; i < workerCount; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for idx := range jobs {
+					userRec, userErr := r.GetUserRecommendations(request.GetUserRecommendations{
+						UserId: users[idx].ID,
+						Limit:  5,
+					})
+
+					if userErr != nil {
+						errCode := "internal_error"
+						if errors.Is(userErr, ErrModelUnavailable) {
+							errCode = "model_unavailable"
+						} else if errors.Is(userErr, gorm.ErrRecordNotFound) {
+							errCode = "user_not_found"
+						}
+
+						results[idx] = response.UserRecommendations{
+							UserID:  users[idx].ID,
+							Status:  "failed",
+							Error:   errCode,
+							Message: userErr.Error(),
+						}
+
+						continue
+					}
+
+					results[idx] = response.UserRecommendations{
+						UserID:          users[idx].ID,
+						Recommendations: userRec.Recommendations,
+						Status:          "success",
+					}
+				}
+			}()
+		}
+
+		for idx := range users {
+			jobs <- idx
+		}
+
+		close(jobs)
+		wg.Wait()
+	}
+
+	var successCount int64
+	var failedCount int64
+	for _, result := range results {
+		if result.Status == "success" {
+			successCount++
+			continue
+		}
+		failedCount++
+	}
+
+	res = response.GetUsersRecommendations{
+		Page:       int64(req.Page),
+		Limit:      int64(req.Limit),
+		TotalUsers: totalUsers,
+		Results:    results,
+		Summary: response.GetUsersRecommendationsSummary{
+			SuccessCount:     successCount,
+			FailedCount:      failedCount,
+			ProcessingTimeMs: time.Since(startedAt).Milliseconds(),
+		},
+		Metadata: response.GetUsersRecommendationsMetaData{
+			GeneratedAt: time.Now().UTC(),
+		},
 	}
 
 	return
 }
 
 func (r *resourceLog) GetUserRecommendations(req request.GetUserRecommendations) (res response.GetUserRecommendations, err error) {
-	cacheKey := fmt.Sprintf("rec:user:%d:limit:%d", req.UserId, req.Limit)
-	cacheTTL := r.redisCof.RedisTTL * time.Minute
-	cacheCtx := context.Background()
+	RedisCacheKey := fmt.Sprintf("rec:user:%d:limit:%d", req.UserId, req.Limit)
+	RedisCacheTTL := time.Duration(r.redisConf.RedisTTL) * time.Minute
+	RedisCacheCtx := context.Background()
 
 	// ?: if has redis
 	if r.redis != nil {
-		cachedPayload, cacheErr := r.redis.Get(cacheCtx, cacheKey).Result()
+		cachedPayload, cacheErr := r.redis.Get(RedisCacheCtx, RedisCacheKey).Result()
 		// ?: if found data in redis or error case not found
 		if cacheErr == nil {
 			if unmarshalErr := json.Unmarshal([]byte(cachedPayload), &res); unmarshalErr == nil {
@@ -89,6 +179,7 @@ func (r *resourceLog) GetUserRecommendations(req request.GetUserRecommendations)
 		return
 	}
 
+	// ?: latency sim
 	seed := time.Now().UnixNano() + req.UserId
 	rng := rand.New(rand.NewSource(seed))
 	time.Sleep(time.Duration(30+rng.Intn(21)) * time.Millisecond)
@@ -190,6 +281,7 @@ func (r *resourceLog) GetUserRecommendations(req request.GetUserRecommendations)
 		limit = len(scored)
 	}
 
+	// ?: get recommend with limit rec
 	recommendations := make([]response.GetUserRecommendationItem, 0, limit)
 	for _, recommendation := range scored[:limit] {
 		recommendations = append(recommendations, recommendation.item)
@@ -213,47 +305,11 @@ func (r *resourceLog) GetUserRecommendations(req request.GetUserRecommendations)
 			return
 		}
 
-		if setErr := r.redis.Set(cacheCtx, cacheKey, serialized, cacheTTL).Err(); setErr != nil {
+		if setErr := r.redis.Set(RedisCacheCtx, RedisCacheKey, serialized, RedisCacheTTL).Err(); setErr != nil {
 			err = setErr
 			return
 		}
 	}
 
 	return
-}
-
-func (r *resourceLog) GetUser(id *int64) (res orm.Users, err error) {
-	db := r.db.Model(&orm.Users{})
-	db = db.Where("id = ?", aws.ToInt64(id)).First(&res)
-	err = db.Error
-
-	return
-}
-
-func (r *resourceLog) CreateUsers(req orm.Users) (err error) {
-	db := r.db.Create(&req)
-	err = db.Error
-
-	return
-}
-
-func mapUserToResponse(user orm.Users) response.GetUsers {
-	watchHistories := make([]response.UserWatchHistory, 0, len(user.WatchHistories))
-	for _, history := range user.WatchHistories {
-		watchHistories = append(watchHistories, response.UserWatchHistory{
-			ID:        history.ID,
-			UserID:    history.UserID,
-			ContentID: history.ContentID,
-			WatchedAt: history.WatchedAt,
-		})
-	}
-
-	return response.GetUsers{
-		ID:               user.ID,
-		Age:              user.Age,
-		Country:          user.Country,
-		SubscriptionType: user.SubscriptionType,
-		CreatedAt:        user.CreatedAt,
-		WatchHistories:   watchHistories,
-	}
 }

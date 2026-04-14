@@ -22,7 +22,7 @@ import (
 
 func main() {
 	if err := godotenv.Load(); err != nil {
-		log.Fatalf("Failed to load environment: %s", color.RedString(err.Error()))
+		log.Printf("No .env file found, using environment variables: %s", color.YellowString(err.Error()))
 	}
 
 	HttpServer := config.NewServer()

@@ -36,7 +36,8 @@ func (r *ResourceRouter) Init(app *fiber.App) {
 
 	userHandler := handler.NewUserHandler(r.db, r.redis, r.validator, r.sessionStore)
 
-	users := app.Group("/users")
-	users.Get("/:user_id/recommendations", userHandler.GetUserRecommendations)
+	// users := app.Group("/users")
+	app.Get("/users/:user_id/recommendations", userHandler.GetUserRecommendations)
+	app.Get("/recommendations/batch", userHandler.GetUsersRecommendations)
 
 }
