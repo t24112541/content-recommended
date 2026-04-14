@@ -1,5 +1,5 @@
 .DS_Store
 .env
-go.sum
+# go.sum
 /tmp
 log

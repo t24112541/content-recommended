@@ -1,10 +1,39 @@
 services:
+  app:
+    container_name: cr-app
+    build: .
+    environment:
+      TZ: $TIME_ZONE
+      APP_HTTP_PORT: $APP_HTTP_PORT
+      APP_NAME: $APP_NAME
+      APP_PREFORK: $APP_PREFORK
+      APP_CASE_SENSITIVE: $APP_CASE_SENSITIVE
+      APP_STRICT_ROUTING: $APP_STRICT_ROUTING
+      APP_SERVER_HEADER: $APP_SERVER_HEADER
+      DB_HOST: cr-db
+      DB_PORT: 5432
+      DB_USER: $DB_USER
+      DB_PASSWORD: $DB_PASSWORD
+      DB_NAME: $DB_NAME
+      DB_SSL_MODE: disable
+      REDIS_HOST: cr-redis
+      REDIS_PORT: $REDIS_DOCKER_PORT
+      REDIS_PASS: $REDIS_PASS
+      REDIS_DB: 0
+      REDIS_TTL: $REDIS_TTL
+    ports:
+      - $APP_HTTP_PORT:$APP_HTTP_PORT
+    depends_on:
+      - postgres
+      - redis
+    restart: always
+
   redis:
     container_name: cr-redis
     image: redis:latest
+    environment:
+      TZ: $TIME_ZONE
     entrypoint: redis-server --requirepass $REDIS_PASS --maxmemory 512mb --maxmemory-policy allkeys-lru
-    networks:
-      - default
     ports:
       - $REDIS_PORT:$REDIS_DOCKER_PORT
     restart: always
