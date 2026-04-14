@@ -1,8 +1,6 @@
 package router
 
 import (
-	"content-recommended/handler"
-
 	"github.com/go-playground/validator/v10"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/session"
@@ -34,10 +32,6 @@ func New(
 // Routes for fiber
 func (r *ResourceRouter) Init(app *fiber.App) {
 
-	userHandler := handler.NewUserHandler(r.db, r.redis, r.validator, r.sessionStore)
-
-	// users := app.Group("/users")
-	app.Get("/users/:user_id/recommendations", userHandler.GetUserRecommendations)
-	app.Get("/recommendations/batch", userHandler.GetUsersRecommendations)
+	app.Route("/", r.userRouter)
 
 }
